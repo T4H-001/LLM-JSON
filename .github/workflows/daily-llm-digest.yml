@@ -1,0 +1,121 @@
+name: Daily LLM Thread Digest
+
+on:
+  schedule:
+    # 9 PM UTC = 7 AM AEST — runs every day, all threads from prior day analysed
+    - cron: '0 21 * * *'
+  workflow_dispatch:
+    inputs:
+      date_override:
+        description: 'Date to analyse (YYYY-MM-DD). Defaults to today (UTC).'
+        required: false
+        default: ''
+
+concurrency:
+  group: llm-json-daily-digest
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-southeast-2
+
+jobs:
+  analyse-threads:
+    name: Analyse all LLM threads
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set run date
+        id: date
+        run: |
+          DATE=${{ github.event.inputs.date_override }}
+          if [ -z "$DATE" ]; then DATE=$(date -u +%Y-%m-%d); fi
+          echo "date=$DATE" >> $GITHUB_OUTPUT
+          echo "Running digest for: $DATE"
+
+      # Step 1 — per-LLM analysis (runs in-place on each provider's stored threads)
+      - name: Invoke llm-json-analyse-in-place
+        id: analyse
+        run: |
+          RESPONSE=$(aws lambda invoke \
+            --function-name llm-json-analyse-in-place \
+            --region ${{ env.AWS_REGION }} \
+            --payload "$(echo '{"date":"${{ steps.date.outputs.date }}","providers":["perplexity","claude","chatgpt","grok","gemini"]}' | base64)" \
+            --cli-binary-format raw-in-base64-out \
+            /tmp/analyse-response.json 2>&1)
+          echo "$RESPONSE"
+          cat /tmp/analyse-response.json
+
+      # Step 2 — aggregate per-LLM outputs into one combined daily feed
+      - name: Invoke llm-json-build-daily-feed
+        id: build_feed
+        run: |
+          aws lambda invoke \
+            --function-name llm-json-build-daily-feed \
+            --region ${{ env.AWS_REGION }} \
+            --payload "$(echo '{"date":"${{ steps.date.outputs.date }}"}' | base64)" \
+            --cli-binary-format raw-in-base64-out \
+            /tmp/feed-response.json
+          cat /tmp/feed-response.json
+
+      # Step 3 — publish learnings back (feeds the machine, updates daily/latest)
+      - name: Invoke llm-json-publish-learnings
+        id: publish
+        run: |
+          aws lambda invoke \
+            --function-name llm-json-publish-learnings \
+            --region ${{ env.AWS_REGION }} \
+            --payload "$(echo '{"date":"${{ steps.date.outputs.date }}","write_github":true}' | base64)" \
+            --cli-binary-format raw-in-base64-out \
+            /tmp/publish-response.json
+          cat /tmp/publish-response.json
+
+      # Step 4 — pull updated summary from S3 and commit it back to repo
+      - name: Pull summary from S3 and commit
+        run: |
+          DATE=${{ steps.date.outputs.date }}
+          BUCKET=$(aws ssm get-parameter --name /t4h/llm-json/bucket --query Parameter.Value --output text)
+          mkdir -p daily/reports/$DATE
+
+          # Pull per-provider reports
+          for PROVIDER in perplexity claude chatgpt grok gemini; do
+            aws s3 cp s3://$BUCKET/daily/$DATE/${PROVIDER}.md \
+              daily/reports/$DATE/${PROVIDER}.md 2>/dev/null \
+              || echo "# $PROVIDER — no report for $DATE" > daily/reports/$DATE/${PROVIDER}.md
+          done
+
+          # Pull combined summary
+          aws s3 cp s3://$BUCKET/daily/$DATE/combined-summary.md \
+            daily/reports/$DATE/combined-summary.md 2>/dev/null \
+            || echo -e "# Combined Summary — $DATE\n\n*Not generated.*" > daily/reports/$DATE/combined-summary.md
+
+          # Update latest pointer
+          cp daily/reports/$DATE/combined-summary.md daily/latest/cross_llm_summary.md
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add daily/
+          git diff --cached --quiet && echo "No changes to commit" || git commit -m "digest($DATE): daily LLM thread analysis [skip ci]"
+          git push
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Daily LLM Digest — ${{ steps.date.outputs.date }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Step | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| analyse-in-place | ${{ steps.analyse.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| build-daily-feed | ${{ steps.build_feed.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| publish-learnings | ${{ steps.publish.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Reports written to \`daily/reports/${{ steps.date.outputs.date }}/\`" >> $GITHUB_STEP_SUMMARY
+          echo "Latest summary: \`daily/latest/cross_llm_summary.md\`" >> $GITHUB_STEP_SUMMARY

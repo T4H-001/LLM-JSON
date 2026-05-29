@@ -1,0 +1,51 @@
+name: Open Issues Snapshot
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/issue-snapshot.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: List open issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eo pipefail
+          mkdir -p audit
+          gh issue list \
+            --repo "$GITHUB_REPOSITORY" \
+            --state open \
+            --limit 50 \
+            --json number,title,body,labels,createdAt,updatedAt,comments,author \
+            > audit/open-issues.json
+          echo "::notice::Found $(jq length audit/open-issues.json) open issues"
+          jq -r '.[] | "#\(.number) [\(.createdAt[:10])] (\(.labels | map(.name) | join(","))) \(.title)"' audit/open-issues.json
+
+      - name: Commit snapshot if changed
+        run: |
+          set -eo pipefail
+          git add audit/open-issues.json
+          if git diff --cached --quiet; then
+            echo "::notice::No changes"
+            exit 0
+          fi
+          git commit -m "chore(audit): refresh open-issues snapshot [skip ci]"
+          git push
